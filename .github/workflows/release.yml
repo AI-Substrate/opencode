@@ -1,0 +1,250 @@
+name: Flowspace Release Packaging
+
+on:
+  # Manual trigger for releases
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Release tag name (e.g., v1.0.0)'
+        required: true
+        type: string
+      release_name:
+        description: 'Release name (optional, defaults to tag)'
+        required: false
+        type: string
+      prerelease:
+        description: 'Mark as pre-release'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  package-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Set release variables
+        id: release-vars
+        run: |
+          # Determine tag name
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG_NAME="${{ github.event.inputs.tag_name }}"
+            RELEASE_NAME="${{ github.event.inputs.release_name }}"
+            PRERELEASE="${{ github.event.inputs.prerelease }}"
+          else
+            TAG_NAME="${{ github.ref_name }}"
+            RELEASE_NAME=""
+            PRERELEASE="false"
+          fi
+          
+          # Set release name if not provided
+          if [ -z "$RELEASE_NAME" ]; then
+            RELEASE_NAME="$TAG_NAME"
+          fi
+          
+          echo "tag-name=$TAG_NAME" >> $GITHUB_OUTPUT
+          echo "release-name=$RELEASE_NAME" >> $GITHUB_OUTPUT
+          echo "prerelease=$PRERELEASE" >> $GITHUB_OUTPUT
+          
+          echo "📦 Preparing release: $RELEASE_NAME ($TAG_NAME)"
+          echo "🏷️ Tag: $TAG_NAME"
+          echo "📝 Name: $RELEASE_NAME" 
+          echo "🧪 Pre-release: $PRERELEASE"
+
+      - name: Find Latest Scan Workflow Run
+        id: find-scan
+        run: |
+          echo "🔍 Finding latest successful scan workflow run..."
+          
+          # Find the most recent successful flowspace-scan-release workflow run
+          RUN_ID=$(gh run list \
+            --workflow=flowspace-scan-release.yml \
+            --status=completed \
+            --limit=20 \
+            --json databaseId,conclusion,headSha \
+            | jq -r '.[] | select(.conclusion == "success") | .databaseId' \
+            | head -1)
+          
+          if [ -z "$RUN_ID" ]; then
+            echo "❌ No successful scan workflow runs found"
+            exit 1
+          fi
+          
+          echo "✅ Found successful scan run: $RUN_ID"
+          echo "run-id=$RUN_ID" >> $GITHUB_OUTPUT
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Download Latest Scan Artifact
+        uses: actions/download-artifact@v5
+        with:
+          name: flowspace-condensed-latest
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ steps.find-scan.outputs.run-id }}
+          path: ./scan-artifact/
+
+      - name: Verify Scan Artifact
+        id: verify-artifact
+        run: |
+          echo "🔍 Verifying downloaded scan artifact..."
+          
+          if [ ! -f "./scan-artifact/condensed.tar.gz" ]; then
+            echo "❌ Scan artifact not found: condensed.tar.gz"
+            exit 1
+          fi
+          
+          # Get artifact info
+          ARTIFACT_SIZE=$(stat -f%z "./scan-artifact/condensed.tar.gz" 2>/dev/null || stat -c%s "./scan-artifact/condensed.tar.gz")
+          ARTIFACT_SIZE_MB=$((ARTIFACT_SIZE / 1024 / 1024))
+          
+          echo "✅ Scan artifact verified"
+          echo "📦 Size: ${ARTIFACT_SIZE_MB}MB (${ARTIFACT_SIZE} bytes)"
+          echo "artifact-size=$ARTIFACT_SIZE" >> $GITHUB_OUTPUT
+          echo "artifact-size-mb=$ARTIFACT_SIZE_MB" >> $GITHUB_OUTPUT
+          
+          # Show archive contents
+          echo "📋 Archive contents:"
+          tar -tzf "./scan-artifact/condensed.tar.gz" | head -10
+
+      - name: Extract and Validate Condensed Data
+        run: |
+          echo "📂 Extracting condensed data for validation..."
+          
+          # Extract to temporary directory
+          mkdir -p ./temp-extract
+          tar -xzf "./scan-artifact/condensed.tar.gz" -C ./temp-extract
+          
+          # Validate structure
+          if [ ! -f "./temp-extract/lfl/condensed.jsonl" ]; then
+            echo "❌ Expected LFL condensed.jsonl not found in archive"
+            exit 1
+          fi
+          
+          # Get condensed data statistics
+          LFL_SIZE=$(stat -f%z "./temp-extract/lfl/condensed.jsonl" 2>/dev/null || stat -c%s "./temp-extract/lfl/condensed.jsonl")
+          LFL_LINES=$(wc -l < "./temp-extract/lfl/condensed.jsonl")
+          LFL_SIZE_MB=$((LFL_SIZE / 1024 / 1024))
+          
+          echo "✅ Condensed data validated"
+          echo "📊 LFL condensed.jsonl: ${LFL_SIZE_MB}MB, ${LFL_LINES} lines"
+
+      - name: Create Release Package
+        id: package
+        run: |
+          echo "📦 Creating release package..."
+          
+          # Create release directory structure
+          mkdir -p ./release-package
+          
+          # Copy scan artifact with simple name
+          cp "./scan-artifact/condensed.tar.gz" "./release-package/flowspace.tar.gz"
+          
+          # Generate checksums
+          cd ./release-package
+          sha256sum *.tar.gz > SHA256SUMS
+          cd ..
+          
+          echo "✅ Release package created"
+          echo "📋 Package contents:"
+          ls -la ./release-package/
+
+      - name: Generate Release Notes
+        id: release-notes
+        run: |
+          echo "📝 Generating release notes..."
+          
+          # Create release notes
+          cat > release-notes.md << 'EOF'
+          # Flowspace Code Analysis Release
+          
+          ## 📊 Analysis Data
+          
+          This release contains comprehensive code analysis data generated by Flowspace:
+          
+          - **LFL Analysis**: Language Foundation Layer data (language-agnostic code structure)
+          - **File Size**: ${{ steps.verify-artifact.outputs.artifact-size-mb }}MB compressed
+          - **Generated**: $(date -u '+%Y-%m-%d %H:%M:%S UTC')
+          - **Source**: Latest successful scan workflow
+          
+          ## 📦 Assets
+          
+          - `flowspace.tar.gz` - Compressed LFL analysis data
+          - `SHA256SUMS` - Checksum verification file
+          
+          ## 🔧 Usage
+          
+          ```bash
+          # Download and extract
+          wget https://github.com/${{ github.repository }}/releases/download/${{ steps.release-vars.outputs.tag-name }}/flowspace.tar.gz
+          tar -xzf flowspace.tar.gz
+          
+          # Verify integrity
+          sha256sum -c SHA256SUMS
+          ```
+          
+          ## 🏗️ Technical Details
+          
+          - **Analysis Layer**: Language Foundation Layer (LFL)
+          - **Data Format**: JSONL (newline-delimited JSON)
+          - **Content**: Code structure, relationships, and metadata
+          - **Language Support**: Multi-language (Python, TypeScript, Go, C#)
+          
+          ---
+          
+          *Generated automatically from workflow artifacts*
+          EOF
+          
+          echo "✅ Release notes generated"
+
+      - name: Create GitHub Release
+        id: create-release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ steps.release-vars.outputs.tag-name }}
+          release_name: ${{ steps.release-vars.outputs.release-name }}
+          body_path: release-notes.md
+          draft: false
+          prerelease: ${{ steps.release-vars.outputs.prerelease }}
+
+      - name: Upload Release Assets
+        run: |
+          echo "⬆️ Uploading release assets..."
+          
+          # Upload main archive
+          gh release upload "${{ steps.release-vars.outputs.tag-name }}" \
+            "./release-package/flowspace.tar.gz" \
+            --clobber
+          
+          # Upload checksums
+          gh release upload "${{ steps.release-vars.outputs.tag-name }}" \
+            "./release-package/SHA256SUMS" \
+            --clobber
+          
+          echo "✅ Release assets uploaded successfully"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Release Summary
+        run: |
+          echo "## 🎉 Release Created Successfully" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Release**: [${{ steps.release-vars.outputs.release-name }}](${{ steps.create-release.outputs.html_url }})" >> $GITHUB_STEP_SUMMARY
+          echo "**Tag**: \`${{ steps.release-vars.outputs.tag-name }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Assets**: flowspace.tar.gz (${{ steps.verify-artifact.outputs.artifact-size-mb }}MB)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📦 Download" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
+          echo "wget https://github.com/${{ github.repository }}/releases/download/${{ steps.release-vars.outputs.tag-name }}/flowspace.tar.gz" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
